@@ -1023,23 +1023,11 @@ export default function AudioUploader() {
           {transcriptState.status === "done" && (
             <div className="divide-y divide-gray-800">
 
-              {/* ── Transcript text ── */}
+              {/* ── Transcript preview ── */}
               <div className="px-5 py-5 space-y-3">
-                <div className="flex items-center justify-between gap-3">
-                  <p className="text-xs font-medium text-gray-500 uppercase tracking-wider">
-                    Transcript
-                  </p>
-                  <button
-                    onClick={() => navigator.clipboard.writeText(transcriptState.text)}
-                    className="text-xs text-gray-500 hover:text-gray-300 transition-colors flex items-center gap-1"
-                    title="Copy to clipboard"
-                  >
-                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 17.25v3.375c0 .621-.504 1.125-1.125 1.125h-9.75a1.125 1.125 0 01-1.125-1.125V7.875c0-.621.504-1.125 1.125-1.125H6.75a9.06 9.06 0 011.5.124m7.5 10.376h3.375c.621 0 1.125-.504 1.125-1.125V11.25c0-4.46-3.243-8.161-7.5-8.876a9.06 9.06 0 00-1.5-.124H9.375c-.621 0-1.125.504-1.125 1.125v3.5m7.5 10.375H9.375a1.125 1.125 0 01-1.125-1.125v-9.25m12 6.625v-1.875a3.375 3.375 0 00-3.375-3.375h-1.5a1.125 1.125 0 01-1.125-1.125v-1.5a3.375 3.375 0 00-3.375-3.375H9.75" />
-                    </svg>
-                    Copy
-                  </button>
-                </div>
+                <p className="text-xs font-medium text-gray-500 uppercase tracking-wider">
+                  Transcript
+                </p>
                 <div
                   ref={transcriptScrollRef}
                   onScroll={() => {
@@ -1061,39 +1049,20 @@ export default function AudioUploader() {
                 </div>
               </div>
 
-              {/* ── Download section ── */}
+              {/* ── Finalize & Export ── */}
               <div className="px-5 py-4 space-y-3">
-                <p className="text-xs font-medium text-gray-500 uppercase tracking-wider">
-                  Download
-                </p>
-                <div className="flex gap-3">
-                  {/* TXT */}
-                  <button
-                    onClick={() => {
-                      const date = new Date().toLocaleDateString("en-GB", { day: "2-digit", month: "long", year: "numeric" });
-                      const header = `Transcription — ${date}\nLanguage: Czech\n${"─".repeat(48)}\n\n`;
-                      const blob = new Blob([header + transcriptState.text], { type: "text/plain;charset=utf-8" });
-                      const url = URL.createObjectURL(blob);
-                      const a = document.createElement("a");
-                      a.href = url; a.download = `${audioFile?.name.replace(/\.[^.]+$/, "") ?? "transcript"}.txt`; a.click();
-                      URL.revokeObjectURL(url);
-                    }}
-                    className="flex-1 flex items-center justify-center gap-2 rounded-xl px-4 py-2.5
-                      bg-gray-800 hover:bg-gray-700 border border-gray-700
-                      text-sm font-medium text-gray-300 hover:text-white transition-colors"
-                  >
-                    <svg className="w-4 h-4 text-gray-400" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m.75 12l3 3m0 0l3-3m-3 3v-6m-1.5-9H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z" />
-                    </svg>
-                    Export as TXT
-                  </button>
-
-                  {/* DOCX */}
-                  <ExportButtons
-                    text={transcriptState.text}
-                    filename={audioFile?.name.replace(/\.[^.]+$/, "") ?? "transcript"}
-                  />
+                <div className="flex items-center gap-2">
+                  <span className="text-emerald-400 text-sm">✅</span>
+                  <p className="text-xs font-medium text-gray-400 uppercase tracking-wider">
+                    Finalize &amp; Export
+                  </p>
                 </div>
+                <ExportButtons
+                  text={transcriptState.text}
+                  filename={audioFile?.name.replace(/\.[^.]+$/, "") ?? "transcript"}
+                  durationSeconds={audioFile?.duration}
+                  enhanced={!!enhancedQuality}
+                />
               </div>
 
             </div>
