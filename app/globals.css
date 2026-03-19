@@ -1,1 +1,27 @@
 @import "tailwindcss";
+
+/* ── Transcript scrollbar — dark theme ─────────────────────────────────────── */
+/* Targets the scrollable transcript containers via the .transcript-scroll class */
+
+.transcript-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: #4b5563 #1f2937; /* thumb: gray-600  track: gray-800 */
+}
+
+.transcript-scroll::-webkit-scrollbar {
+  width: 6px;
+}
+
+.transcript-scroll::-webkit-scrollbar-track {
+  background: #1f2937; /* gray-800 */
+  border-radius: 9999px;
+}
+
+.transcript-scroll::-webkit-scrollbar-thumb {
+  background: #4b5563; /* gray-600 */
+  border-radius: 9999px;
+}
+
+.transcript-scroll::-webkit-scrollbar-thumb:hover {
+  background: #6b7280; /* gray-500 */
+}

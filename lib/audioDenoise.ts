@@ -1,12 +1,19 @@
 /**
- * lib/audioDenoise.ts — Segmented RNNoise denoising orchestrator
+ * lib/audioDenoise.ts — Segmented RNNoise denoising via OfflineAudioContext
  *
- * Splits a 16 kHz Float32Array into 1-minute segments, sends them one at a
- * time to /denoise-worker.js via Transferable Objects, collects the results,
- * and stitches them back into a single buffer.
+ * Each 1-minute segment is rendered through an OfflineAudioContext at 44 100 Hz
+ * with the NoiseSuppressorWorklet (AudioWorklet).  The worklet runs the same
+ * WASM code path that ships with @timephy/rnnoise-wasm and is the only tested,
+ * reliable way to call _rnnoise_process_frame without triggering WASM traps.
  *
- * Processing one segment at a time keeps peak WASM heap usage at ~3.8 MB
- * (one 60-second slice × 4 bytes/sample) regardless of total audio length.
+ * Pipeline per segment:
+ *   1. Upsample segment Float32Array from 16 kHz → 44 100 Hz in-browser
+ *      (create AudioBuffer at 44 100 Hz with the upsampled data).
+ *   2. Route it through AudioBufferSourceNode → NoiseSuppressorWorklet →
+ *      ctx.destination inside an OfflineAudioContext at 44 100 Hz.
+ *   3. ctx.startRendering() returns a denoised AudioBuffer at 44 100 Hz.
+ *   4. Downsample result 44 100 Hz → 16 kHz (linear interpolation).
+ *   5. Collect all denoised 16 kHz segments and concatenate.
  */
 
 export interface DenoiseProgress {
@@ -22,159 +29,149 @@ export interface DenoiseProgress {
   totalSegments: number;
 }
 
-// ── Segmentation constants ────────────────────────────────────────────────────
+// ── Constants ─────────────────────────────────────────────────────────────────
 
-/** Audio seconds per segment sent to the worker. */
-const SEGMENT_SECS    = 60;
-/** Samples per segment at 16 kHz. ~3.84 MB each — well within WASM limits. */
-const SEGMENT_SAMPLES = SEGMENT_SECS * 16_000;   // 960 000
-const TARGET_SR       = 16_000;
+const TARGET_SR     = 16_000;
+const WORKLET_SR    = 44_100;
+const SEGMENT_SECS  = 60;
+const SEGMENT_IN    = SEGMENT_SECS * TARGET_SR;   // 960 000 samples @ 16 kHz
 
-function splitSegments(pcm: Float32Array): Float32Array[] {
-  const segs: Float32Array[] = [];
-  for (let off = 0; off < pcm.length; off += SEGMENT_SAMPLES) {
-    // slice() copies — this frees the source region from the transferred buffer
-    segs.push(pcm.slice(off, Math.min(off + SEGMENT_SAMPLES, pcm.length)));
+// ── Resampling helpers ────────────────────────────────────────────────────────
+
+/** Linear interpolation resample — returns a NEW Float32Array. */
+function resample(input: Float32Array, srcRate: number, dstRate: number): Float32Array {
+  if (srcRate === dstRate) return input.slice();
+  const ratio  = srcRate / dstRate;
+  const outLen = Math.round(input.length * dstRate / srcRate);
+  const out    = new Float32Array(outLen);
+  const maxSrc = input.length - 1;
+  for (let i = 0; i < outLen; i++) {
+    const pos  = i * ratio;
+    const lo   = pos | 0;
+    const hi   = lo < maxSrc ? lo + 1 : maxSrc;
+    const frac = pos - lo;
+    out[i]     = input[lo] + frac * (input[hi] - input[lo]);
   }
-  return segs;
+  return out;
+}
+
+// ── Single-segment processing ─────────────────────────────────────────────────
+
+/**
+ * Denoises one segment (Float32Array at 16 kHz) via OfflineAudioContext +
+ * NoiseSuppressorWorklet.  Returns a new Float32Array at 16 kHz.
+ */
+async function processSegment(
+  seg16k: Float32Array,
+  segLabel: string,
+): Promise<Float32Array> {
+  const t0 = performance.now();
+
+  // 1. Upsample to 44 100 Hz
+  const seg44k = resample(seg16k, TARGET_SR, WORKLET_SR);
+
+  // 2. Create OfflineAudioContext at 44 100 Hz
+  const ctx = new OfflineAudioContext(1, seg44k.length, WORKLET_SR);
+
+  // 3. Load the worklet module (each OfflineAudioContext instance needs its own load)
+  await ctx.audioWorklet.addModule("/rnnoise/NoiseSuppressorWorklet.js");
+
+  // 4. Put upsampled PCM into an AudioBuffer
+  const srcBuf = ctx.createBuffer(1, seg44k.length, WORKLET_SR);
+  srcBuf.copyToChannel(seg44k as Float32Array<ArrayBuffer>, 0);
+
+  // 5. Wire: source → worklet → destination
+  const source  = ctx.createBufferSource();
+  source.buffer = srcBuf;
+
+  const worklet = new AudioWorkletNode(ctx, "NoiseSuppressorWorklet");
+  source.connect(worklet);
+  worklet.connect(ctx.destination);
+  source.start(0);
+
+  // 6. Render (non-real-time, as fast as CPU allows)
+  const rendered = await ctx.startRendering();
+
+  // 7. Downsample 44 100 Hz → 16 kHz
+  const denoised44k = rendered.getChannelData(0);
+  const result16k   = resample(denoised44k, WORKLET_SR, TARGET_SR);
+
+  const elapsed = (performance.now() - t0).toFixed(0);
+  console.log(`[denoise] ${segLabel} done in ${elapsed} ms`);
+
+  return result16k;
 }
 
 // ── Main export ───────────────────────────────────────────────────────────────
 
 /**
- * Denoises a 16 kHz mono Float32Array using RNNoise WASM running in a
- * dedicated Web Worker (/denoise-worker.js).
+ * Denoises a 16 kHz mono Float32Array using RNNoise via OfflineAudioContext.
  *
- * The audio is split into {@link SEGMENT_SECS}-second segments. Each segment
- * is transferred zero-copy to the worker, processed, and transferred back
- * before the next segment is sent, preventing the WASM heap from accumulating
- * the full recording in memory.
+ * The audio is split into {@link SEGMENT_SECS}-second segments processed
+ * sequentially.  Each segment is denoised independently; the results are
+ * concatenated back into a single Float32Array at 16 kHz.
  *
- * @param pcm16k     Float32Array at 16 kHz (copied into segments internally)
- * @param onProgress Called on every worker progress message
+ * @param pcm16k     Float32Array at 16 kHz
+ * @param onProgress Called after each segment completes
  * @returns          Denoised Float32Array at 16 kHz (new allocation)
  */
-export function denoiseAudio(
+export async function denoiseAudio(
   pcm16k: Float32Array,
   onProgress: (p: DenoiseProgress) => void,
 ): Promise<Float32Array> {
-  return new Promise((resolve, reject) => {
-    const totalSeconds  = pcm16k.length / TARGET_SR;
-    const segments      = splitSegments(pcm16k);
-    const totalSegments = segments.length;
-    const results: Float32Array[] = [];
-    let segmentIndex    = 0;
-    const wallStart     = performance.now();
+  const totalSeconds  = pcm16k.length / TARGET_SR;
+  const totalSegments = Math.ceil(pcm16k.length / SEGMENT_IN);
+  const results: Float32Array[] = [];
+  const wallStart = performance.now();
 
-    // Heap-size advisory logged to the console
-    const totalMB = (pcm16k.length * 4) / (1024 * 1024);
-    if (totalMB > 50) {
-      console.warn(
-        `[denoise] Input is ${totalMB.toFixed(0)} MB total. ` +
-        `Splitting into ${totalSegments} × ${SEGMENT_SECS} s segment(s) ` +
-        `(≈${(SEGMENT_SAMPLES * 4 / 1024 / 1024).toFixed(1)} MB each).`
-      );
-    }
+  function calcEta(overallPct: number): number | null {
+    if (overallPct < 5) return null;
+    const elapsed = performance.now() - wallStart;
+    return (elapsed / overallPct) * (100 - overallPct) / 1000;
+  }
 
-    const worker = new Worker("/denoise-worker.js", { type: "module" });
+  for (let i = 0; i < totalSegments; i++) {
+    const start  = i * SEGMENT_IN;
+    const end    = Math.min(start + SEGMENT_IN, pcm16k.length);
+    const seg    = pcm16k.slice(start, end);
+    const label  = `segment ${i + 1}/${totalSegments}`;
 
-    /** Compute overall ETA from wall-clock elapsed and progress fraction. */
-    function calcEta(overallPct: number): number | null {
-      if (overallPct < 5) return null;
-      const elapsed = performance.now() - wallStart;
-      return (elapsed / overallPct) * (100 - overallPct) / 1000;
-    }
-
-    /** Send the next segment, or finalise if all are done. */
-    function sendNext(): void {
-      if (segmentIndex >= totalSegments) {
-        worker.terminate();
-
-        // Reconstruct into a single contiguous Float32Array
-        const totalLen = results.reduce((s, r) => s + r.length, 0);
-        const out = new Float32Array(totalLen);
-        let off = 0;
-        for (const r of results) { out.set(r, off); off += r.length; }
-
-        console.log(
-          `[denoise] All ${totalSegments} segment(s) complete — ` +
-          `${(totalLen / TARGET_SR).toFixed(1)} s reconstructed.`
-        );
-        resolve(out);
-        return;
-      }
-
-      const seg   = segments[segmentIndex];
-      const segMB = (seg.length * 4) / (1024 * 1024);
-      if (segMB > 50) {
-        console.warn(
-          `[denoise] Segment ${segmentIndex + 1}/${totalSegments} ` +
-          `is ${segMB.toFixed(1)} MB — may stress WASM heap.`
-        );
-      }
-
-      console.log(
-        `[denoise] → Sending segment ${segmentIndex + 1}/${totalSegments} ` +
-        `(${seg.length.toLocaleString()} samples, ${segMB.toFixed(2)} MB)`
-      );
-
-      // Transfer zero-copy — `seg.buffer` becomes detached in this thread
-      worker.postMessage({ type: "denoise_segment", segment: seg }, [seg.buffer]);
-    }
-
-    worker.addEventListener("message", (e: MessageEvent) => {
-      const msg = e.data as
-        | { type: "segment_progress"; progress: number }
-        | { type: "segment_result";   segment: Float32Array }
-        | { type: "error";            message: string };
-
-      if (msg.type === "segment_progress") {
-        // Blend intra-segment progress into the overall 0–100 scale
-        const overall = Math.round(
-          ((segmentIndex + msg.progress / 100) / totalSegments) * 100
-        );
-        const processedSeconds = Math.min(
-          segmentIndex * SEGMENT_SECS +
-            (msg.progress / 100) * (segments[segmentIndex]?.length ?? 0) / TARGET_SR,
-          totalSeconds,
-        );
-        onProgress({
-          progress:         overall,
-          processedSeconds,
-          totalSeconds,
-          timeRemaining:    calcEta(overall),
-          segmentIndex:     segmentIndex + 1,
-          totalSegments,
-        });
-
-      } else if (msg.type === "segment_result") {
-        results.push(msg.segment);
-        segmentIndex++;
-
-        const overall          = Math.round((segmentIndex / totalSegments) * 100);
-        const processedSeconds = Math.min(segmentIndex * SEGMENT_SECS, totalSeconds);
-        onProgress({
-          progress:         overall,
-          processedSeconds,
-          totalSeconds,
-          timeRemaining:    calcEta(overall),
-          segmentIndex,
-          totalSegments,
-        });
-
-        sendNext();
-
-      } else if (msg.type === "error") {
-        worker.terminate();
-        reject(new Error(msg.message));
-      }
+    // Report start of segment
+    const startPct = Math.round((i / totalSegments) * 100);
+    onProgress({
+      progress:         startPct,
+      processedSeconds: Math.min(i * SEGMENT_SECS, totalSeconds),
+      totalSeconds,
+      timeRemaining:    calcEta(startPct),
+      segmentIndex:     i + 1,
+      totalSegments,
     });
 
-    worker.addEventListener("error", (e: ErrorEvent) => {
-      worker.terminate();
-      reject(new Error(e.message ?? "Denoise worker crashed"));
-    });
+    const denoised = await processSegment(seg, label);
+    results.push(denoised);
 
-    sendNext();
-  });
+    // Report completion of segment
+    const donePct = Math.round(((i + 1) / totalSegments) * 100);
+    onProgress({
+      progress:         donePct,
+      processedSeconds: Math.min((i + 1) * SEGMENT_SECS, totalSeconds),
+      totalSeconds,
+      timeRemaining:    calcEta(donePct),
+      segmentIndex:     i + 1,
+      totalSegments,
+    });
+  }
+
+  // Concatenate all denoised segments
+  const totalLen = results.reduce((s, r) => s + r.length, 0);
+  const out      = new Float32Array(totalLen);
+  let off        = 0;
+  for (const r of results) { out.set(r, off); off += r.length; }
+
+  console.log(
+    `[denoise] All ${totalSegments} segment(s) complete — ` +
+    `${(totalLen / TARGET_SR).toFixed(1)} s reconstructed.`
+  );
+
+  return out;
 }

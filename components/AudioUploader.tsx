@@ -90,6 +90,9 @@ export default function AudioUploader() {
   const audioRef = useRef<HTMLAudioElement>(null);
   const rafRef = useRef<number | null>(null);
   const workerRef = useRef<Worker | null>(null);
+  const transcriptScrollRef = useRef<HTMLDivElement>(null);
+  /** True when the user has manually scrolled up — pauses auto-scroll. */
+  const userScrolledUp = useRef(false);
 
   useEffect(() => {
     return () => {
@@ -97,6 +100,21 @@ export default function AudioUploader() {
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
     };
   }, []);
+
+  // ── Auto-scroll: follow new text unless user scrolled up ─────────────────
+  useEffect(() => {
+    const el = transcriptScrollRef.current;
+    if (!el) return;
+    if (!userScrolledUp.current) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [
+    transcriptState.status === "transcribing"
+      ? (transcriptState as { partialText: string }).partialText
+      : transcriptState.status === "done"
+      ? (transcriptState as { text: string }).text
+      : null,
+  ]);
 
   // ── Worker lifecycle ──────────────────────────────────────────────────────
 
@@ -162,6 +180,7 @@ export default function AudioUploader() {
 
   const handleTranscribe = useCallback(async () => {
     if (!audioFile) return;
+    userScrolledUp.current = false;
     setTranscriptState({ status: "loading-model", file: "", progress: 0, device: deviceRef.current });
 
     try {
@@ -980,10 +999,22 @@ export default function AudioUploader() {
 
               {/* Live partial text */}
               {transcriptState.partialText && (
-                <p className="text-gray-400 text-xs leading-relaxed line-clamp-3">
-                  {transcriptState.partialText}
-                  <span className="inline-block w-1.5 h-3 ml-0.5 bg-violet-400 animate-pulse rounded-sm align-middle" />
-                </p>
+                <div
+                  ref={transcriptScrollRef}
+                  onScroll={() => {
+                    const el = transcriptScrollRef.current;
+                    if (!el) return;
+                    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 32;
+                    userScrolledUp.current = !atBottom;
+                  }}
+                  className="transcript-scroll min-h-[200px] max-h-[600px] h-auto overflow-y-auto rounded-xl
+                    bg-gray-800/40 border border-gray-700/50 px-4 py-3"
+                >
+                  <p className="text-gray-400 text-sm leading-relaxed whitespace-pre-wrap">
+                    {transcriptState.partialText}
+                    <span className="inline-block w-1.5 h-3 ml-0.5 bg-violet-400 animate-pulse rounded-sm align-middle" />
+                  </p>
+                </div>
               )}
             </div>
           )}
@@ -1009,11 +1040,25 @@ export default function AudioUploader() {
                     Copy
                   </button>
                 </div>
-                <p className="text-white text-sm leading-relaxed whitespace-pre-wrap">
-                  {transcriptState.text || (
-                    <span className="text-gray-500 italic">No speech detected</span>
+                <div
+                  ref={transcriptScrollRef}
+                  onScroll={() => {
+                    const el = transcriptScrollRef.current;
+                    if (!el) return;
+                    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 32;
+                    userScrolledUp.current = !atBottom;
+                  }}
+                  className="transcript-scroll min-h-[200px] max-h-[600px] h-auto overflow-y-auto rounded-xl
+                    bg-gray-800/40 border border-gray-700/50 px-4 py-3"
+                >
+                  {transcriptState.text ? (
+                    <p className="text-white text-sm leading-relaxed whitespace-pre-wrap">
+                      {transcriptState.text}
+                    </p>
+                  ) : (
+                    <p className="text-gray-500 italic text-sm">No speech detected</p>
                   )}
-                </p>
+                </div>
               </div>
 
               {/* ── Download section ── */}
