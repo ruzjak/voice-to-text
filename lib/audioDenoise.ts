@@ -115,9 +115,15 @@ async function processSegment(
  * @param onProgress Called after each segment completes
  * @returns          Denoised Float32Array at 16 kHz (new allocation)
  */
+/** Thrown (and caught by the caller) when the user stops enhancement mid-run. */
+export class DenoiseAbortError extends Error {
+  constructor() { super("Enhancement stopped by user"); this.name = "DenoiseAbortError"; }
+}
+
 export async function denoiseAudio(
   pcm16k: Float32Array,
   onProgress: (p: DenoiseProgress) => void,
+  signal?: { readonly aborted: boolean },
 ): Promise<Float32Array> {
   const totalSeconds  = pcm16k.length / TARGET_SR;
   const totalSegments = Math.ceil(pcm16k.length / SEGMENT_IN);
@@ -131,6 +137,10 @@ export async function denoiseAudio(
   }
 
   for (let i = 0; i < totalSegments; i++) {
+    // Check abort before starting each segment (segment rendering is not cancellable
+    // mid-flight, but we stop cleanly at the next boundary).
+    if (signal?.aborted) throw new DenoiseAbortError();
+
     const start  = i * SEGMENT_IN;
     const end    = Math.min(start + SEGMENT_IN, pcm16k.length);
     const seg    = pcm16k.slice(start, end);

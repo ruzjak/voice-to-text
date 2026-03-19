@@ -6,7 +6,7 @@ import ExportButtons from "./ExportButtons";
 import { resampleTo16kHz, resampleBufferTo16kHz } from "@/lib/resample";
 import { analyzeAudioQuality, isQualityPoor } from "@/lib/audioQuality";
 import { enhanceAudioBuffer } from "@/lib/audioEnhance";
-import { denoiseAudio } from "@/lib/audioDenoise";
+import { denoiseAudio, DenoiseAbortError } from "@/lib/audioDenoise";
 
 const ACCEPTED_EXTENSIONS = [".mp3", ".m4a", ".wav"];
 
@@ -33,6 +33,7 @@ type TranscriptState =
   | { status: "loading-model"; file: string; progress: number; device: "webgpu" | "wasm" | null }
   | { status: "transcribing"; current: number; total: number; progress: number; partialText: string; statusLabel: string; processedSeconds: number; totalSeconds: number; timeRemaining: number | null; device: "webgpu" | "wasm" | null }
   | { status: "done"; text: string }
+  | { status: "stopped" }
   | { status: "error"; message: string };
 
 // Messages sent FROM public/worker.js TO the main thread
@@ -102,11 +103,16 @@ export default function AudioUploader() {
   const transcriptScrollRef = useRef<HTMLDivElement>(null);
   /** True when the user has manually scrolled up — pauses auto-scroll. */
   const userScrolledUp = useRef(false);
+  /** Set to true by handleStop(); checked by denoiseAudio() between segments. */
+  const enhanceAbortRef = useRef({ aborted: false });
+  /** Auto-clear timeout for the "stopped" notice. */
+  const stoppedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     return () => {
       workerRef.current?.terminate();
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      if (stoppedTimerRef.current) clearTimeout(stoppedTimerRef.current);
     };
   }, []);
 
@@ -242,7 +248,8 @@ export default function AudioUploader() {
   const handleEnhance = useCallback(async () => {
     if (!audioFile?.rawBuffer) return;
 
-    // Kick off with "enhancing" at 0 %
+    // Reset abort flag and kick off at 0 %
+    enhanceAbortRef.current = { aborted: false };
     setQualityState({ status: "enhancing", progress: 0, processedSeconds: 0, totalSeconds: 0, timeRemaining: null, segmentIndex: 0, totalSegments: 0 });
     enhancedPcmRef.current = null;
 
@@ -267,7 +274,7 @@ export default function AudioUploader() {
           segmentIndex:     p.segmentIndex,
           totalSegments:    p.totalSegments,
         });
-      });
+      }, enhanceAbortRef.current);
 
       enhancedPcmRef.current = denoised;
 
@@ -280,10 +287,6 @@ export default function AudioUploader() {
       setEnhancedQuality({ rmsDb: result.rmsDb, snrDb: result.snrDb });
       setQualityState({ status: "enhanced", rmsDb: result.rmsDb, snrDb: result.snrDb });
 
-      // Promote the enhanced buffer only when it actually improves clarity.
-      // If the denoiser made things worse (heavy distortion artefacts), keep
-      // the original selected so the user doesn't accidentally transcribe
-      // degraded audio without noticing.
       const isDegraded = originalQuality !== null && result.snrDb < originalQuality.snrDb;
       if (!isDegraded) {
         setTranscriptionSource("enhanced");
@@ -296,14 +299,27 @@ export default function AudioUploader() {
         );
       }
 
-      // If the enhanced SNR is still below the safe threshold, warn the user
       if (isQualityPoor(result)) setShowQualityToast(true);
 
     } catch (err) {
-      console.error("[enhance] Error:", err);
-      setQualityState((prev) =>
-        prev.status === "enhancing" ? { status: "warn", rmsDb: 0, snrDb: 0 } : prev
-      );
+      if (err instanceof DenoiseAbortError) {
+        // Stopped by user — revert to the pre-enhancement quality state
+        console.log("[enhance] Stopped by user — reverting to original quality state.");
+        enhancedPcmRef.current = null;
+        setEnhancedQuality(null);
+        setTranscriptionSource("original");
+        setQualityState(
+          originalQuality
+            ? { status: isQualityPoor(originalQuality) ? "warn" : "good",
+                rmsDb: originalQuality.rmsDb, snrDb: originalQuality.snrDb }
+            : { status: "idle" }
+        );
+      } else {
+        console.error("[enhance] Error:", err);
+        setQualityState((prev) =>
+          prev.status === "enhancing" ? { status: "warn", rmsDb: 0, snrDb: 0 } : prev
+        );
+      }
     }
   }, [audioFile, originalQuality]);
 
@@ -455,10 +471,38 @@ export default function AudioUploader() {
     if (inputRef.current) inputRef.current.value = "";
   };
 
+  // ── Stop handler ─────────────────────────────────────────────────────────
+
+  const handleStop = useCallback(() => {
+    if (qualityState.status === "enhancing") {
+      // Signal the denoiseAudio loop to abort before its next segment
+      enhanceAbortRef.current.aborted = true;
+      // handleEnhance's catch(DenoiseAbortError) takes care of state cleanup
+    }
+
+    if (
+      transcriptState.status === "loading-model" ||
+      transcriptState.status === "transcribing"
+    ) {
+      // Kill the worker immediately — this is the only way to interrupt ONNX inference
+      workerRef.current?.terminate();
+      workerRef.current = null;   // force getOrCreateWorker to build a fresh one
+
+      // Show the "stopped" notice, then clear it after 3 s
+      setTranscriptState({ status: "stopped" });
+      if (stoppedTimerRef.current) clearTimeout(stoppedTimerRef.current);
+      stoppedTimerRef.current = setTimeout(() => {
+        setTranscriptState((prev) => prev.status === "stopped" ? { status: "idle" } : prev);
+      }, 3000);
+    }
+  }, [qualityState.status, transcriptState.status]);
+
   const waveformProgress = audioFile ? currentTime / audioFile.duration : 0;
   const isBusy =
     transcriptState.status === "loading-model" ||
     transcriptState.status === "transcribing";
+  const isEnhancing = qualityState.status === "enhancing";
+  const isAnyProcessing = isBusy || isEnhancing;
 
   // ── Render ────────────────────────────────────────────────────────────────
 
@@ -596,7 +640,7 @@ export default function AudioUploader() {
           <div className="px-5 pb-5">
             <button
               onClick={handleTranscribe}
-              disabled={isBusy}
+              disabled={isAnyProcessing}
               className={`w-full flex items-center justify-center gap-2 rounded-xl px-4 py-3 text-sm font-medium transition-all
                 active:scale-[0.99] text-white
                 disabled:opacity-50 disabled:cursor-not-allowed
@@ -780,7 +824,7 @@ export default function AudioUploader() {
                 </div>
                 <button
                   onClick={handleEnhance}
-                  disabled={isBusy}
+                  disabled={isAnyProcessing}
                   className="flex items-center gap-2 rounded-xl px-4 py-2.5 text-sm font-medium
                     bg-yellow-500/15 hover:bg-yellow-500/25 text-yellow-400
                     border border-yellow-500/30 transition-colors
@@ -800,12 +844,11 @@ export default function AudioUploader() {
             {/* Enhancing spinner */}
             {qualityState.status === "enhancing" && (
               <div className="space-y-2.5">
-                {/* Top row: label + ETA + percent */}
+                {/* Top row: label + ETA + percent + Stop */}
                 <div className="flex items-center justify-between text-sm">
                   <div className="flex items-center gap-2 text-blue-400">
                     <span className="w-3.5 h-3.5 rounded-full border-2 border-blue-400 border-t-transparent animate-spin shrink-0" />
                     <span>✨ Enhancing Audio…</span>
-                    {/* Segment badge — visible once we know the total */}
                     {qualityState.totalSegments > 1 && (
                       <span className="text-xs px-2 py-0.5 rounded-full font-medium
                         bg-blue-500/15 text-blue-400 border border-blue-500/30 tabular-nums">
@@ -822,6 +865,18 @@ export default function AudioUploader() {
                         : `${formatTime(qualityState.timeRemaining)} remaining`}
                     </span>
                     <span className="text-gray-500 tabular-nums text-sm">{qualityState.progress}%</span>
+                    <button
+                      onClick={handleStop}
+                      className="flex items-center gap-1 rounded-lg px-2.5 py-1 text-xs font-medium
+                        border border-red-500/50 text-red-400 bg-red-500/10
+                        hover:bg-red-500/20 hover:border-red-500/70 transition-colors"
+                      title="Stop enhancement"
+                    >
+                      <svg className="w-3 h-3 shrink-0" fill="currentColor" viewBox="0 0 24 24">
+                        <rect x="6" y="6" width="12" height="12" rx="1" />
+                      </svg>
+                      Stop
+                    </button>
                   </div>
                 </div>
 
@@ -1077,7 +1132,21 @@ export default function AudioUploader() {
                     </span>
                   )}
                 </div>
-                <span className="text-gray-500 tabular-nums">{transcriptState.progress}%</span>
+                <div className="flex items-center gap-2">
+                  <span className="text-gray-500 tabular-nums">{transcriptState.progress}%</span>
+                  <button
+                    onClick={handleStop}
+                    className="flex items-center gap-1 rounded-lg px-2.5 py-1 text-xs font-medium
+                      border border-red-500/50 text-red-400 bg-red-500/10
+                      hover:bg-red-500/20 hover:border-red-500/70 transition-colors"
+                    title="Stop"
+                  >
+                    <svg className="w-3 h-3 shrink-0" fill="currentColor" viewBox="0 0 24 24">
+                      <rect x="6" y="6" width="12" height="12" rx="1" />
+                    </svg>
+                    Stop
+                  </button>
+                </div>
               </div>
               {transcriptState.file && (
                 <p className="text-gray-600 text-xs truncate">{transcriptState.file}</p>
@@ -1119,6 +1188,18 @@ export default function AudioUploader() {
                     </span>
                   )}
                   <span className="text-gray-500 tabular-nums">{transcriptState.progress}%</span>
+                  <button
+                    onClick={handleStop}
+                    className="flex items-center gap-1 rounded-lg px-2.5 py-1 text-xs font-medium
+                      border border-red-500/50 text-red-400 bg-red-500/10
+                      hover:bg-red-500/20 hover:border-red-500/70 transition-colors"
+                    title="Stop transcription"
+                  >
+                    <svg className="w-3 h-3 shrink-0" fill="currentColor" viewBox="0 0 24 24">
+                      <rect x="6" y="6" width="12" height="12" rx="1" />
+                    </svg>
+                    Stop
+                  </button>
                 </div>
               </div>
 
@@ -1217,6 +1298,16 @@ export default function AudioUploader() {
                 />
               </div>
 
+            </div>
+          )}
+
+          {/* Stopped notice */}
+          {transcriptState.status === "stopped" && (
+            <div className="flex items-center gap-3 px-5 py-4 text-sm text-red-400">
+              <svg className="w-4 h-4 shrink-0" fill="currentColor" viewBox="0 0 24 24">
+                <rect x="6" y="6" width="12" height="12" rx="1" />
+              </svg>
+              <span>Process terminated by user.</span>
             </div>
           )}
 
