@@ -25,7 +25,7 @@ type QualityState =
   | { status: "idle" }
   | { status: "good";      rmsDb: number; snrDb: number }
   | { status: "warn";      rmsDb: number; snrDb: number }
-  | { status: "enhancing"; progress: number; processedSeconds: number; totalSeconds: number; timeRemaining: number | null }
+  | { status: "enhancing"; progress: number; processedSeconds: number; totalSeconds: number; timeRemaining: number | null; segmentIndex: number; totalSegments: number }
   | { status: "enhanced";  rmsDb: number; snrDb: number };
 
 type TranscriptState =
@@ -198,7 +198,7 @@ export default function AudioUploader() {
     if (!audioFile?.rawBuffer) return;
 
     // Kick off with "enhancing" at 0 %
-    setQualityState({ status: "enhancing", progress: 0, processedSeconds: 0, totalSeconds: 0, timeRemaining: null });
+    setQualityState({ status: "enhancing", progress: 0, processedSeconds: 0, totalSeconds: 0, timeRemaining: null, segmentIndex: 0, totalSegments: 0 });
     enhancedPcmRef.current = null;
 
     try {
@@ -219,6 +219,8 @@ export default function AudioUploader() {
           processedSeconds: p.processedSeconds,
           totalSeconds:     p.totalSeconds,
           timeRemaining:    p.timeRemaining,
+          segmentIndex:     p.segmentIndex,
+          totalSegments:    p.totalSegments,
         });
       });
 
@@ -627,13 +629,22 @@ export default function AudioUploader() {
             {/* Enhancing spinner */}
             {qualityState.status === "enhancing" && (
               <div className="space-y-2.5">
+                {/* Top row: label + ETA + percent */}
                 <div className="flex items-center justify-between text-sm">
                   <div className="flex items-center gap-2 text-blue-400">
                     <span className="w-3.5 h-3.5 rounded-full border-2 border-blue-400 border-t-transparent animate-spin shrink-0" />
                     <span>✨ Enhancing Audio…</span>
+                    {/* Segment badge — visible once we know the total */}
+                    {qualityState.totalSegments > 1 && (
+                      <span className="text-xs px-2 py-0.5 rounded-full font-medium
+                        bg-blue-500/15 text-blue-400 border border-blue-500/30 tabular-nums">
+                        {qualityState.segmentIndex > 0 ? qualityState.segmentIndex : 1}
+                        {" / "}
+                        {qualityState.totalSegments}
+                      </span>
+                    )}
                   </div>
                   <div className="flex items-center gap-2">
-                    {/* ETA */}
                     <span className="text-gray-600 text-xs tabular-nums">
                       {qualityState.timeRemaining === null
                         ? qualityState.progress > 0 ? "Calculating…" : ""
@@ -654,9 +665,9 @@ export default function AudioUploader() {
                   />
                 </div>
 
-                {/* Minutes counter — appears once the worker starts reporting */}
-                {qualityState.totalSeconds > 0 && (
-                  <div className="flex items-center justify-between text-xs text-gray-500">
+                {/* Bottom row: processed time + segment detail */}
+                <div className="flex items-center justify-between text-xs text-gray-500">
+                  {qualityState.totalSeconds > 0 ? (
                     <span>
                       Processed:{" "}
                       <span className="text-blue-400 font-medium tabular-nums">
@@ -667,9 +678,20 @@ export default function AudioUploader() {
                         {(qualityState.totalSeconds / 60).toFixed(1)} min
                       </span>
                     </span>
+                  ) : (
+                    <span>Initialising…</span>
+                  )}
+                  {qualityState.totalSegments > 1 ? (
+                    <span className="tabular-nums text-gray-600">
+                      segment{" "}
+                      {qualityState.segmentIndex > 0 ? qualityState.segmentIndex : 1}
+                      {" of "}
+                      {qualityState.totalSegments}
+                    </span>
+                  ) : (
                     <span className="text-gray-600">noise reduction</span>
-                  </div>
-                )}
+                  )}
+                </div>
               </div>
             )}
 
