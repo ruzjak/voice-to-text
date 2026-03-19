@@ -91,6 +91,8 @@ export default function AudioUploader() {
     enableVadPadding: true,
     enableThresholds: true,
   });
+  /** When true: use whisper-large-v3-turbo instead of whisper-medium. */
+  const [forceTurbo, setForceTurbo] = useState(false);
 
   const deviceRef       = useRef<"webgpu" | "wasm" | null>(null);
   // Cleaned 16 kHz PCM ready for Whisper. Set after full enhance+denoise pipeline.
@@ -217,6 +219,10 @@ export default function AudioUploader() {
 
       const worker = getOrCreateWorker();
 
+      const modelName = forceTurbo
+        ? "onnx-community/whisper-large-v3-turbo"
+        : "Xenova/whisper-medium";
+
       // In debug mode the config matches UI checkboxes; in normal mode all flags
       // are on (the tuned defaults).
       const config = debugMode
@@ -225,15 +231,17 @@ export default function AudioUploader() {
             enablePrompting:  inferenceConfig.enablePrompting,
             enableVadPadding: inferenceConfig.enableVadPadding,
             enableThresholds: inferenceConfig.enableThresholds,
+            modelName,
           }
         : {
             debugMode:        false,
             enablePrompting:  true,
             enableVadPadding: true,
             enableThresholds: true,
+            modelName,
           };
 
-      worker.postMessage({ type: "load" });
+      worker.postMessage({ type: "load", modelName });
       worker.postMessage({ type: "transcribe", audio, config }, [audio.buffer]);
     } catch (err) {
       setTranscriptState({
@@ -241,7 +249,7 @@ export default function AudioUploader() {
         message: err instanceof Error ? err.message : "Resampling failed",
       });
     }
-  }, [audioFile, debugMode, inferenceConfig, transcriptionSource, getOrCreateWorker]);
+  }, [audioFile, debugMode, forceTurbo, inferenceConfig, transcriptionSource, getOrCreateWorker]);
 
   // ── Audio enhancement ────────────────────────────────────────────────────
 
@@ -466,6 +474,7 @@ export default function AudioUploader() {
     setTranscriptionSource("original");
     setShowQualityToast(false);
     setDebugMode(false);
+    setForceTurbo(false);
     setInferenceConfig({ enablePrompting: true, enableVadPadding: true, enableThresholds: true });
     enhancedPcmRef.current = null;
     if (inputRef.current) inputRef.current.value = "";
@@ -678,6 +687,45 @@ export default function AudioUploader() {
         </div>
       )}
 
+      {/* ── Model selector ────────────────────────────────────────────────── */}
+      {audioFile && (
+        <div className="rounded-2xl bg-gray-900 border border-gray-800 px-5 py-3">
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2.5 min-w-0">
+              <svg className={`w-3.5 h-3.5 shrink-0 ${forceTurbo ? "text-amber-400" : "text-gray-500"}`}
+                fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round"
+                  d="M3.75 13.5l10.5-11.25L12 10.5h8.25L9.75 21.75 12 13.5H3.75z" />
+              </svg>
+              <div className="min-w-0">
+                <p className={`text-sm font-medium ${forceTurbo ? "text-amber-400" : "text-gray-400"}`}>
+                  Force Turbo Model
+                </p>
+                <p className="text-xs text-gray-600 font-mono">
+                  {forceTurbo
+                    ? "whisper-large-v3-turbo (~600 MB) — Safe Mode"
+                    : "whisper-medium (~800 MB–1.2 GB) — default"}
+                </p>
+              </div>
+            </div>
+            <button
+              onClick={() => setForceTurbo(t => !t)}
+              disabled={isAnyProcessing}
+              className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full
+                transition-colors focus:outline-none
+                disabled:opacity-40 disabled:cursor-not-allowed
+                ${forceTurbo ? "bg-amber-500" : "bg-gray-700"}`}
+              title={forceTurbo ? "Switch back to Medium model" : "Switch to Turbo model (Safe Mode)"}
+            >
+              <span className={`inline-block h-4 w-4 rounded-full bg-white shadow
+                transform transition-transform
+                ${forceTurbo ? "translate-x-6" : "translate-x-1"}`}
+              />
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* ── Debug Mode panel ──────────────────────────────────────────────── */}
       {audioFile && (
         <div className={`rounded-2xl border overflow-hidden transition-colors ${
@@ -744,7 +792,7 @@ export default function AudioUploader() {
                     {
                       key: "enableThresholds" as const,
                       label: "Anti-artifact thresholds",
-                      description: "logprob −0.6 · no_speech 0.1 · compression 2.6",
+                      description: "logprob −0.8 · no_speech 0.35 · rep_penalty 1.1 · beams 5",
                     },
                     {
                       key: "enablePrompting" as const,
@@ -1158,7 +1206,9 @@ export default function AudioUploader() {
                 />
               </div>
               <p className="text-gray-600 text-xs">
-                First run downloads ~600 MB — cached for next time
+                {forceTurbo
+                  ? "First run downloads ~600 MB (Turbo) — cached for next time"
+                  : "First run downloads ~800 MB–1.2 GB (Medium) — cached for next time"}
               </p>
             </div>
           )}
@@ -1332,9 +1382,8 @@ export default function AudioUploader() {
             <div className="flex-1 min-w-0">
               <p className="text-sm font-medium text-yellow-400">Still detecting low quality</p>
               <p className="text-xs text-gray-400 mt-0.5 leading-relaxed">
-                The enhanced audio still has a low SNR. For Czech lectures, consider switching to a
-                slower, more precise Whisper model (e.g.{" "}
-                <span className="font-mono text-gray-300">whisper-large-v3</span>) for better accuracy.
+                The enhanced audio still has a low SNR. Results may be inaccurate — try using
+                the Debug panel to compare original vs enhanced, or check your recording setup.
               </p>
             </div>
             <button

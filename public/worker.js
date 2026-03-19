@@ -30,9 +30,11 @@ import { pipeline, env } from "https://cdn.jsdelivr.net/npm/@huggingface/transfo
 
 env.allowLocalModels   = false;
 env.useBrowserCache    = true;
-env.backends.onnx.wasm.proxy = true;
+env.backends.onnx.wasm.proxy    = true;
+env.backends.onnx.wasm.numThreads = navigator.hardwareConcurrency || 4;
 
-const MODEL    = "onnx-community/whisper-large-v3-turbo";
+const MODEL_MEDIUM = "Xenova/whisper-medium";
+const MODEL_TURBO  = "onnx-community/whisper-large-v3-turbo";
 const CHUNK_S  = 30;
 const STRIDE_S = 5;
 const SR       = 16_000;
@@ -42,8 +44,8 @@ const VAD_PAD_S       = 0.2;
 const VAD_PAD_SAMPLES = Math.round(VAD_PAD_S * SR); // 3 200 samples
 const SILENCE         = new Float32Array(VAD_PAD_SAMPLES);
 
-/** Approx chars to carry over as cross-chunk context (~128 tokens × 4 chars/tok). */
-const PROMPT_CHARS = 512;
+/** Approx chars to carry over as cross-chunk context (~64 tokens × 4 chars/tok). */
+const PROMPT_CHARS = 256;
 
 // ── WebGPU detection ─────────────────────────────────────────────────────────
 
@@ -61,12 +63,21 @@ async function detectWebGPU() {
 
 let transcriber      = null;
 let modelLoadPromise = null;
+let loadedModel      = null;
 
-function getOrLoadModel() {
-  if (transcriber)      return Promise.resolve(transcriber);
-  if (modelLoadPromise) return modelLoadPromise;
+function getOrLoadModel(modelName = MODEL_MEDIUM) {
+  // Serve cached instance if the same model is already loaded
+  if (transcriber      && loadedModel === modelName) return Promise.resolve(transcriber);
+  if (modelLoadPromise && loadedModel === modelName) return modelLoadPromise;
 
-  console.log("[worker] Model load START:", MODEL);
+  // Different model requested — drop the old singleton and reload
+  if (loadedModel !== modelName) {
+    transcriber      = null;
+    modelLoadPromise = null;
+    loadedModel      = modelName;
+  }
+
+  console.log("[worker] Model load START:", modelName);
   self.postMessage({ type: "status", status: "loading" });
 
   modelLoadPromise = (async () => {
@@ -80,9 +91,10 @@ function getOrLoadModel() {
       ? { encoder_model: "fp16", decoder_model_merged: "q4" }
       : "q8";
 
-    return pipeline("automatic-speech-recognition", MODEL, {
+    return pipeline("automatic-speech-recognition", modelName, {
       device,
-      dtype: dtypeConfig,
+      dtype:     dtypeConfig,
+      quantized: !hasWebGPU,  // quantized WASM path; WebGPU uses dtype config
       progress_callback: (p) => {
         if (p.status === "progress") {
           const pct = Math.round(p.progress ?? 0);
@@ -174,6 +186,24 @@ function buildPrompt(parts) {
   return parts.join(" ").slice(-PROMPT_CHARS);
 }
 
+// ── Memory pressure check ─────────────────────────────────────────────────────
+
+/** Logs a console warning if JS heap usage is approaching 1.8 GB. */
+function checkMemoryPressure() {
+  if (!performance.memory) return;
+  const usedGB = performance.memory.usedJSHeapSize / (1024 ** 3);
+  const limitGB = performance.memory.jsHeapSizeLimit / (1024 ** 3);
+  console.log(
+    `[worker] Memory — used: ${usedGB.toFixed(2)} GB / limit: ${limitGB.toFixed(2)} GB`
+  );
+  if (usedGB > 1.8) {
+    console.warn(
+      `[worker] ⚠️ MEMORY PRESSURE — ${usedGB.toFixed(2)} GB used. ` +
+      `Transcription may crash. Consider switching to Turbo model.`
+    );
+  }
+}
+
 // ── Transcription ─────────────────────────────────────────────────────────────
 
 async function transcribeAudio(audio, config) {
@@ -182,9 +212,12 @@ async function transcribeAudio(audio, config) {
     enablePrompting  = true,
     enableVadPadding = true,
     enableThresholds = true,
+    modelName        = MODEL_MEDIUM,
   } = config ?? {};
 
-  const pipe = await getOrLoadModel();
+  checkMemoryPressure();
+
+  const pipe = await getOrLoadModel(modelName);
 
   const totalSeconds = audio.length / SR;
   const chunks       = buildChunks(audio, enableVadPadding);
@@ -297,9 +330,11 @@ async function transcribeAudio(audio, config) {
 
       // Anti-artifact thresholds — skipped in debug/raw mode
       ...(enableThresholds ? {
-        logprob_threshold:          -0.6,
-        no_speech_threshold:         0.1,
-        compression_ratio_threshold: 2.6,
+        condition_on_previous_text: true,
+        logprob_threshold:          -0.8,
+        no_speech_threshold:         0.35,
+        repetition_penalty:          1.1,
+        num_beams:                   5,
       } : {}),
 
       // Cross-chunk context prompt — skipped when disabled
@@ -395,7 +430,7 @@ async function transcribeAudio(audio, config) {
 self.addEventListener("message", async (e) => {
   try {
     if (e.data.type === "load") {
-      await getOrLoadModel();
+      await getOrLoadModel(e.data.modelName ?? MODEL_MEDIUM);
     } else if (e.data.type === "transcribe") {
       await transcribeAudio(e.data.audio, e.data.config);
     }
