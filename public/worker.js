@@ -8,12 +8,20 @@
  * Message protocol
  * ────────────────
  * IN  { type: 'load' }
- * IN  { type: 'transcribe', audio: Float32Array }   (transferable)
+ * IN  { type: 'transcribe', audio: Float32Array, config?: InferenceConfig }
+ *
+ * InferenceConfig (all optional, defaults to "full quality" mode):
+ *   debugMode        — log chunk-level diagnostics to the console
+ *   enablePrompting  — pass prior-chunk text as context prompt (default: true)
+ *   enableVadPadding — prepend/append 200ms silence to each chunk (default: true)
+ *   enableThresholds — apply anti-artifact Whisper thresholds (default: true)
  *
  * OUT { type: 'status',          status: 'loading' | 'ready' }
  * OUT { type: 'device',          device: 'webgpu' | 'wasm' }
  * OUT { type: 'model_progress',  file: string, progress: number }
- * OUT { type: 'chunk_progress',  current, total, progress, partialText, statusLabel, processedSeconds, totalSeconds, timeRemaining }
+ * OUT { type: 'chunk_progress',  current, total, progress, partialText,
+ *                                statusLabel, processedSeconds, totalSeconds,
+ *                                timeRemaining }
  * OUT { type: 'result',          text: string }
  * OUT { type: 'error',           message: string }
  */
@@ -22,9 +30,6 @@ import { pipeline, env } from "https://cdn.jsdelivr.net/npm/@huggingface/transfo
 
 env.allowLocalModels   = false;
 env.useBrowserCache    = true;
-// proxy=true offloads ONNX runtime into a sub-worker; this is a no-op when
-// we are already inside a Worker, but harmless and future-safe for main-thread
-// usage.
 env.backends.onnx.wasm.proxy = true;
 
 const MODEL    = "onnx-community/whisper-large-v3-turbo";
@@ -32,14 +37,13 @@ const CHUNK_S  = 30;
 const STRIDE_S = 5;
 const SR       = 16_000;
 
-/** 200 ms of silence prepended/appended to each chunk.
- *  Prevents RNNoise from clipping the first/last phonemes at boundaries. */
+/** 200 ms of silence prepended/appended to each chunk (VAD padding). */
 const VAD_PAD_S       = 0.2;
 const VAD_PAD_SAMPLES = Math.round(VAD_PAD_S * SR); // 3 200 samples
+const SILENCE         = new Float32Array(VAD_PAD_SAMPLES);
 
-/** How many tokens of previous chunk text to pass as a context prompt.
- *  Whisper's total token budget is 448; 128 leaves room for the new chunk. */
-const PROMPT_TOKENS = 128;
+/** Approx chars to carry over as cross-chunk context (~128 tokens × 4 chars/tok). */
+const PROMPT_CHARS = 512;
 
 // ── WebGPU detection ─────────────────────────────────────────────────────────
 
@@ -53,7 +57,7 @@ async function detectWebGPU() {
   }
 }
 
-// ── Model singleton with load-once queuing ────────────────────────────────────
+// ── Model singleton ───────────────────────────────────────────────────────────
 
 let transcriber      = null;
 let modelLoadPromise = null;
@@ -72,9 +76,6 @@ function getOrLoadModel() {
     console.log(`[worker] Device selected: ${device}`);
     self.postMessage({ type: "device", device });
 
-    // dtype strategy:
-    //   WebGPU — FP16 encoder + 4-bit merged decoder (fast GPU path)
-    //   WASM   — INT8 across the board (safe, ~balanced memory/speed)
     const dtypeConfig = hasWebGPU
       ? { encoder_model: "fp16", decoder_model_merged: "q4" }
       : "q8";
@@ -100,100 +101,132 @@ function getOrLoadModel() {
   return modelLoadPromise;
 }
 
-// ── Chunking with VAD padding ─────────────────────────────────────────────────
-//
-// Each chunk gets VAD_PAD_SAMPLES of silence prepended and appended.
-// This prevents the denoiser from clipping the first/last phonemes at the
-// boundary, and gives Whisper a clean lead-in.
+// ── Chunking ──────────────────────────────────────────────────────────────────
 
-const SILENCE = new Float32Array(VAD_PAD_SAMPLES); // all-zero, reusable
-
-function buildChunks(audio) {
-  const chunkLen = CHUNK_S  * SR;               // 480 000 samples
-  const step     = (CHUNK_S - STRIDE_S) * SR;   // 400 000 samples (25 s advance)
+function buildChunks(audio, withPadding) {
+  const chunkLen = CHUNK_S  * SR;
+  const step     = (CHUNK_S - STRIDE_S) * SR;
   const chunks   = [];
   let start = 0;
   while (start < audio.length) {
     const end  = Math.min(start + chunkLen, audio.length);
     const core = audio.slice(start, end);
 
-    // Pad: [silence | core | silence]
-    const padded = new Float32Array(SILENCE.length + core.length + SILENCE.length);
-    padded.set(SILENCE, 0);
-    padded.set(core,    SILENCE.length);
-    padded.set(SILENCE, SILENCE.length + core.length);
+    let slice;
+    if (withPadding) {
+      slice = new Float32Array(SILENCE.length + core.length + SILENCE.length);
+      slice.set(SILENCE, 0);
+      slice.set(core,    SILENCE.length);
+      slice.set(SILENCE, SILENCE.length + core.length);
+    } else {
+      slice = core;
+    }
 
-    chunks.push({ slice: padded, startSec: start / SR, coreSamples: core.length });
+    chunks.push({ slice, startSec: start / SR, coreSamples: core.length });
     if (end >= audio.length) break;
     start += step;
   }
-  console.log(
-    `[worker] buildChunks — audio ${(audio.length / SR).toFixed(1)} s → ` +
-    `${chunks.length} chunk(s) of ${CHUNK_S} s with ${STRIDE_S} s stride ` +
-    `+ ${VAD_PAD_S * 1000} ms VAD padding each side`
-  );
   return chunks;
 }
 
 // ── ETA helpers ───────────────────────────────────────────────────────────────
-//
-// We keep a sliding window of the last WINDOW real-wall seconds-per-audio-second
-// ratios (one entry per completed chunk).  The average of those gives a stable
-// estimate that ignores cold-start variance on the first chunk.
-//
-// timeRemaining = null  → still in the "Calculating…" phase (< 5 % processed
-//                         OR no completed chunks yet).
 
-const ETA_WINDOW = 3; // chunks
+const ETA_WINDOW = 3;
 
 function makeEtaTracker() {
-  const times = []; // wall-ms taken by each completed chunk
+  const times = [];
   return {
     record(wallMs, audioSecs) {
-      times.push(wallMs / audioSecs); // ms per audio-second
+      times.push(wallMs / audioSecs);
       if (times.length > ETA_WINDOW) times.shift();
     },
     estimate(remainingAudioSecs, progressFraction) {
       if (times.length === 0 || progressFraction < 0.05) return null;
-      const avgMsPerAudioSec = times.reduce((a, b) => a + b, 0) / times.length;
-      return (avgMsPerAudioSec * remainingAudioSecs) / 1000;
+      const avg = times.reduce((a, b) => a + b, 0) / times.length;
+      return (avg * remainingAudioSecs) / 1000;
     },
   };
 }
 
+// ── Debug helpers ─────────────────────────────────────────────────────────────
+
+/** RMS level of a Float32Array — useful for detecting silent chunks. */
+function computeRMS(samples) {
+  let sum = 0;
+  for (let i = 0; i < samples.length; i++) sum += samples[i] * samples[i];
+  return Math.sqrt(sum / (samples.length || 1));
+}
+
+/** Peak absolute value of a Float32Array. */
+function computePeak(samples) {
+  let peak = 0;
+  for (let i = 0; i < samples.length; i++) {
+    const v = Math.abs(samples[i]);
+    if (v > peak) peak = v;
+  }
+  return peak;
+}
+
 // ── Prompt helper ─────────────────────────────────────────────────────────────
-//
-// Pass the tail of the previous chunk's text as a context prompt so Whisper
-// maintains vocabulary continuity across chunk boundaries (reduces repetition
-// loops and hallucinated "..." runs on quiet lecture segments).
 
 function buildPrompt(parts) {
   if (parts.length === 0) return undefined;
-  // Join all prior parts, take the last PROMPT_TOKENS characters as a rough
-  // token proxy (Czech averages ~4 chars/token with wordpiece).
-  const joined = parts.join(" ");
-  return joined.slice(-PROMPT_TOKENS * 4); // ~128 tokens
+  return parts.join(" ").slice(-PROMPT_CHARS);
 }
 
 // ── Transcription ─────────────────────────────────────────────────────────────
 
-async function transcribeAudio(audio) {
+async function transcribeAudio(audio, config) {
+  const {
+    debugMode        = false,
+    enablePrompting  = true,
+    enableVadPadding = true,
+    enableThresholds = true,
+  } = config ?? {};
+
   const pipe = await getOrLoadModel();
 
   const totalSeconds = audio.length / SR;
-  const chunks       = buildChunks(audio);
+  const chunks       = buildChunks(audio, enableVadPadding);
   const total        = chunks.length;
   const parts        = [];
   const eta          = makeEtaTracker();
 
-  console.group(`[worker] Inference START — ${total} chunk(s), total ${totalSeconds.toFixed(1)} s`);
+  const modeLabel = debugMode
+    ? `[DEBUG raw — prompting:${enablePrompting} padding:${enableVadPadding} thresholds:${enableThresholds}]`
+    : "[normal]";
 
-  // Report 0 % before first chunk so the UI enters "transcribing" state
+  console.group(
+    `[worker] Inference START ${modeLabel} — ` +
+    `${total} chunk(s), total ${totalSeconds.toFixed(1)} s`
+  );
+
+  if (debugMode) {
+    const audioRMS  = computeRMS(audio);
+    const audioPeak = computePeak(audio);
+    console.log(
+      `[debug] Full audio — RMS: ${audioRMS.toFixed(5)}, ` +
+      `Peak: ${audioPeak.toFixed(5)}, ` +
+      `Duration: ${totalSeconds.toFixed(2)} s, ` +
+      `Samples: ${audio.length.toLocaleString()}`
+    );
+    console.log(
+      `[debug] Config — enablePrompting: ${enablePrompting}, ` +
+      `enableVadPadding: ${enableVadPadding}, ` +
+      `enableThresholds: ${enableThresholds}`
+    );
+    console.log(
+      debugMode
+        ? "[debug] ⚠️  Using STOCK Whisper parameters (no anti-artifact thresholds)"
+        : "[debug] Using tuned anti-artifact thresholds"
+    );
+  }
+
   self.postMessage({
     type: "chunk_progress",
     current: 0, total, progress: 0,
     partialText:      "",
-    statusLabel:      "Starting transcription…",
+    statusLabel:      debugMode ? "⚙️ Debug Mode — Starting…" : "Starting transcription…",
     processedSeconds: 0,
     totalSeconds,
     timeRemaining:    null,
@@ -202,17 +235,57 @@ async function transcribeAudio(audio) {
   for (let i = 0; i < total; i++) {
     const { slice, startSec, coreSamples } = chunks[i];
     const label = total === 1
-      ? "Transcribing…"
-      : `Transcribing chunk ${i + 1} of ${total}…`;
+      ? (debugMode ? "⚙️ Debug Transcribing…" : "Transcribing…")
+      : (debugMode
+          ? `⚙️ Debug chunk ${i + 1}/${total}…`
+          : `Transcribing chunk ${i + 1} of ${total}…`);
+
+    if (debugMode) {
+      // Core slice (without padding) for accurate signal stats
+      const core = audio.slice(
+        Math.round(startSec * SR),
+        Math.min(Math.round(startSec * SR) + coreSamples, audio.length)
+      );
+      const coreRMS  = computeRMS(core);
+      const corePeak = computePeak(core);
+      const silentPct = (() => {
+        let silentCount = 0;
+        for (let s = 0; s < core.length; s++) if (Math.abs(core[s]) < 0.001) silentCount++;
+        return ((silentCount / core.length) * 100).toFixed(1);
+      })();
+
+      console.group(
+        `[debug] ── Chunk ${i + 1}/${total} ──  ` +
+        `offset ${startSec.toFixed(1)} s, core ${(coreSamples / SR).toFixed(1)} s`
+      );
+      console.log(
+        `[debug] Signal: RMS=${coreRMS.toFixed(5)}, Peak=${corePeak.toFixed(5)}, ` +
+        `~${silentPct}% near-silent samples (<0.001)`
+      );
+      console.log(
+        `[debug] Padding: ${enableVadPadding ? `${VAD_PAD_S * 1000} ms each side` : "none"}`
+      );
+      const prompt = enablePrompting ? buildPrompt(parts) : undefined;
+      console.log(
+        `[debug] Prompt: ${prompt
+          ? `"…${prompt.slice(-80)}" (${prompt.length} chars)`
+          : "none"}`
+      );
+      if (coreRMS < 0.005) {
+        console.warn(
+          `[debug] ⚠️  VERY LOW SIGNAL on chunk ${i + 1} ` +
+          `(RMS ${coreRMS.toFixed(5)}) — Whisper may output empty or hallucinated text`
+        );
+      }
+    }
 
     console.log(
-      `[worker] Inference chunk ${i + 1}/${total} START — ` +
-      `offset ${startSec.toFixed(1)} s, ` +
-      `core ${(coreSamples / SR).toFixed(1)} s + ${VAD_PAD_S * 1000} ms padding each side`
+      `[worker] Chunk ${i + 1}/${total} START — ` +
+      `offset ${startSec.toFixed(1)} s, ${(coreSamples / SR).toFixed(1)} s`
     );
     const t = performance.now();
 
-    const prompt = buildPrompt(parts);
+    const prompt = enablePrompting ? buildPrompt(parts) : undefined;
 
     let tokenCount = 0;
     const output = await pipe(slice, {
@@ -222,25 +295,29 @@ async function transcribeAudio(audio) {
       stride_length_s:   STRIDE_S,
       return_timestamps: false,
 
-      // ── Anti-artifact thresholds ───────────────────────────────────────
-      // logprob_threshold: allow the model to be more persistent with quiet
-      //   speech — default is -1.0, raising to -0.6 keeps more weak tokens.
-      // no_speech_threshold: 0.1 prevents Whisper from silencing quiet segments
-      //   it would otherwise mark as non-speech (default 0.6 is too aggressive
-      //   for lecture audio with background noise).
-      // compression_ratio_threshold: 2.6 permits natural lecture repetition
-      //   (formulas, enumerations) that the default 2.4 would flag as loops.
-      logprob_threshold:           -0.6,
-      no_speech_threshold:          0.1,
-      compression_ratio_threshold:  2.6,
+      // Anti-artifact thresholds — skipped in debug/raw mode
+      ...(enableThresholds ? {
+        logprob_threshold:          -0.6,
+        no_speech_threshold:         0.1,
+        compression_ratio_threshold: 2.6,
+      } : {}),
 
-      // ── Cross-chunk context prompt ─────────────────────────────────────
-      // Feed the tail of the previous chunk's text so the decoder maintains
-      // vocabulary continuity across boundaries (Czech proper nouns, terms).
+      // Cross-chunk context prompt — skipped when disabled
       ...(prompt !== undefined ? { prompt } : {}),
 
-      callback_function: () => {
+      callback_function: (beams) => {
         tokenCount++;
+
+        // Debug: log beam scores every 50 tokens to surface logprob signals
+        if (debugMode && tokenCount % 50 === 0 && beams?.length) {
+          const beam = beams[0];
+          console.log(
+            `[debug] Token ${tokenCount} — ` +
+            `score: ${beam.score?.toFixed(4) ?? "n/a"}, ` +
+            `output_token_ids.length: ${beam.output_token_ids?.length ?? "n/a"}`
+          );
+        }
+
         if (tokenCount % 10 === 0) {
           const processedSeconds  = Math.min(startSec + CHUNK_S, totalSeconds);
           const progressFraction  = (i + tokenCount / 500) / total;
@@ -268,10 +345,21 @@ async function transcribeAudio(audio) {
     const processedSeconds  = Math.min(startSec + coreSamples / SR, totalSeconds);
     const progressFraction  = (i + 1) / total;
     const remainingAudioSec = Math.max(0, totalSeconds - processedSeconds);
+
+    if (debugMode) {
+      const verdict = text
+        ? `✅ "${text.slice(0, 100)}${text.length > 100 ? "…" : ""}"`
+        : "⚠️  EMPTY — no speech detected by model";
+      console.log(
+        `[debug] Chunk ${i + 1} result: ${verdict}\n` +
+        `        tokens=${tokenCount}, wall=${wallMs.toFixed(0)} ms, ` +
+        `tokens/s=${(tokenCount / (wallMs / 1000)).toFixed(1)}`
+      );
+      console.groupEnd();
+    }
+
     console.log(
-      `[worker] Inference chunk ${i + 1}/${total} END — ` +
-      `${wallMs.toFixed(0)} ms — ` +
-      `processed up to ${processedSeconds.toFixed(1)} s — ` +
+      `[worker] Chunk ${i + 1}/${total} END — ${wallMs.toFixed(0)} ms — ` +
       `"${text.slice(0, 60)}${text.length > 60 ? "…" : ""}"`
     );
 
@@ -289,7 +377,16 @@ async function transcribeAudio(audio) {
 
   console.groupEnd();
   const finalText = parts.join(" ").trim();
-  console.log(`[worker] Inference COMPLETE — final text: "${finalText.slice(0, 120)}"`);
+
+  if (debugMode) {
+    console.log("─".repeat(60));
+    console.log(`[debug] ✅ FINAL RESULT (${finalText.length} chars, ${total} chunks)`);
+    console.log(`[debug] "${finalText.slice(0, 300)}${finalText.length > 300 ? "…" : ""}"`);
+    console.log("─".repeat(60));
+  } else {
+    console.log(`[worker] Inference COMPLETE — "${finalText.slice(0, 120)}"`);
+  }
+
   self.postMessage({ type: "result", text: finalText });
 }
 
@@ -300,7 +397,7 @@ self.addEventListener("message", async (e) => {
     if (e.data.type === "load") {
       await getOrLoadModel();
     } else if (e.data.type === "transcribe") {
-      await transcribeAudio(e.data.audio);
+      await transcribeAudio(e.data.audio, e.data.config);
     }
   } catch (err) {
     console.error("[worker] ERROR:", err);
