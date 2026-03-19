@@ -8,13 +8,7 @@
  * Message protocol
  * ────────────────
  * IN  { type: 'load' }
- * IN  { type: 'transcribe', audio: Float32Array, config?: InferenceConfig }
- *
- * InferenceConfig (all optional, defaults to "full quality" mode):
- *   debugMode        — log chunk-level diagnostics to the console
- *   enablePrompting  — pass prior-chunk text as context prompt (default: true)
- *   enableVadPadding — prepend/append 200ms silence to each chunk (default: true)
- *   enableThresholds — apply anti-artifact Whisper thresholds (default: true)
+ * IN  { type: 'transcribe', audio: Float32Array }
  *
  * OUT { type: 'status',          status: 'loading' | 'ready' }
  * OUT { type: 'device',          device: 'webgpu' | 'wasm' }
@@ -28,13 +22,12 @@
 
 import { pipeline, env } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3";
 
-env.allowLocalModels   = false;
-env.useBrowserCache    = true;
-env.backends.onnx.wasm.proxy    = true;
+env.allowLocalModels              = false;
+env.useBrowserCache               = true;
+env.backends.onnx.wasm.proxy      = true;
 env.backends.onnx.wasm.numThreads = navigator.hardwareConcurrency || 4;
 
-const MODEL_MEDIUM = "Xenova/whisper-medium";
-const MODEL_TURBO  = "onnx-community/whisper-large-v3-turbo";
+const MODEL    = "onnx-community/whisper-large-v3-turbo";
 const CHUNK_S  = 30;
 const STRIDE_S = 5;
 const SR       = 16_000;
@@ -63,21 +56,12 @@ async function detectWebGPU() {
 
 let transcriber      = null;
 let modelLoadPromise = null;
-let loadedModel      = null;
 
-function getOrLoadModel(modelName = MODEL_MEDIUM) {
-  // Serve cached instance if the same model is already loaded
-  if (transcriber      && loadedModel === modelName) return Promise.resolve(transcriber);
-  if (modelLoadPromise && loadedModel === modelName) return modelLoadPromise;
+function getOrLoadModel() {
+  if (transcriber)      return Promise.resolve(transcriber);
+  if (modelLoadPromise) return modelLoadPromise;
 
-  // Different model requested — drop the old singleton and reload
-  if (loadedModel !== modelName) {
-    transcriber      = null;
-    modelLoadPromise = null;
-    loadedModel      = modelName;
-  }
-
-  console.log("[worker] Model load START:", modelName);
+  console.log("[worker] Model load START:", MODEL);
   self.postMessage({ type: "status", status: "loading" });
 
   modelLoadPromise = (async () => {
@@ -91,10 +75,10 @@ function getOrLoadModel(modelName = MODEL_MEDIUM) {
       ? { encoder_model: "fp16", decoder_model_merged: "q4" }
       : "q8";
 
-    return pipeline("automatic-speech-recognition", modelName, {
+    return pipeline("automatic-speech-recognition", MODEL, {
       device,
       dtype:     dtypeConfig,
-      quantized: !hasWebGPU,  // quantized WASM path; WebGPU uses dtype config
+      quantized: !hasWebGPU,
       progress_callback: (p) => {
         if (p.status === "progress") {
           const pct = Math.round(p.progress ?? 0);
@@ -115,7 +99,7 @@ function getOrLoadModel(modelName = MODEL_MEDIUM) {
 
 // ── Chunking ──────────────────────────────────────────────────────────────────
 
-function buildChunks(audio, withPadding) {
+function buildChunks(audio) {
   const chunkLen = CHUNK_S  * SR;
   const step     = (CHUNK_S - STRIDE_S) * SR;
   const chunks   = [];
@@ -124,15 +108,11 @@ function buildChunks(audio, withPadding) {
     const end  = Math.min(start + chunkLen, audio.length);
     const core = audio.slice(start, end);
 
-    let slice;
-    if (withPadding) {
-      slice = new Float32Array(SILENCE.length + core.length + SILENCE.length);
-      slice.set(SILENCE, 0);
-      slice.set(core,    SILENCE.length);
-      slice.set(SILENCE, SILENCE.length + core.length);
-    } else {
-      slice = core;
-    }
+    // VAD padding: 200 ms silence on each side prevents boundary clipping
+    const slice = new Float32Array(SILENCE.length + core.length + SILENCE.length);
+    slice.set(SILENCE, 0);
+    slice.set(core,    SILENCE.length);
+    slice.set(SILENCE, SILENCE.length + core.length);
 
     chunks.push({ slice, startSec: start / SR, coreSamples: core.length });
     if (end >= audio.length) break;
@@ -160,25 +140,6 @@ function makeEtaTracker() {
   };
 }
 
-// ── Debug helpers ─────────────────────────────────────────────────────────────
-
-/** RMS level of a Float32Array — useful for detecting silent chunks. */
-function computeRMS(samples) {
-  let sum = 0;
-  for (let i = 0; i < samples.length; i++) sum += samples[i] * samples[i];
-  return Math.sqrt(sum / (samples.length || 1));
-}
-
-/** Peak absolute value of a Float32Array. */
-function computePeak(samples) {
-  let peak = 0;
-  for (let i = 0; i < samples.length; i++) {
-    const v = Math.abs(samples[i]);
-    if (v > peak) peak = v;
-  }
-  return peak;
-}
-
 // ── Prompt helper ─────────────────────────────────────────────────────────────
 
 function buildPrompt(parts) {
@@ -186,80 +147,26 @@ function buildPrompt(parts) {
   return parts.join(" ").slice(-PROMPT_CHARS);
 }
 
-// ── Memory pressure check ─────────────────────────────────────────────────────
-
-/** Logs a console warning if JS heap usage is approaching 1.8 GB. */
-function checkMemoryPressure() {
-  if (!performance.memory) return;
-  const usedGB = performance.memory.usedJSHeapSize / (1024 ** 3);
-  const limitGB = performance.memory.jsHeapSizeLimit / (1024 ** 3);
-  console.log(
-    `[worker] Memory — used: ${usedGB.toFixed(2)} GB / limit: ${limitGB.toFixed(2)} GB`
-  );
-  if (usedGB > 1.8) {
-    console.warn(
-      `[worker] ⚠️ MEMORY PRESSURE — ${usedGB.toFixed(2)} GB used. ` +
-      `Transcription may crash. Consider switching to Turbo model.`
-    );
-  }
-}
-
 // ── Transcription ─────────────────────────────────────────────────────────────
 
-async function transcribeAudio(audio, config) {
-  const {
-    debugMode        = false,
-    enablePrompting  = true,
-    enableVadPadding = true,
-    enableThresholds = true,
-    modelName        = MODEL_MEDIUM,
-  } = config ?? {};
-
-  checkMemoryPressure();
-
-  const pipe = await getOrLoadModel(modelName);
+async function transcribeAudio(audio) {
+  const pipe = await getOrLoadModel();
 
   const totalSeconds = audio.length / SR;
-  const chunks       = buildChunks(audio, enableVadPadding);
+  const chunks       = buildChunks(audio);
   const total        = chunks.length;
   const parts        = [];
   const eta          = makeEtaTracker();
 
-  const modeLabel = debugMode
-    ? `[DEBUG raw — prompting:${enablePrompting} padding:${enableVadPadding} thresholds:${enableThresholds}]`
-    : "[normal]";
-
   console.group(
-    `[worker] Inference START ${modeLabel} — ` +
-    `${total} chunk(s), total ${totalSeconds.toFixed(1)} s`
+    `[worker] Inference START — ${total} chunk(s), total ${totalSeconds.toFixed(1)} s`
   );
-
-  if (debugMode) {
-    const audioRMS  = computeRMS(audio);
-    const audioPeak = computePeak(audio);
-    console.log(
-      `[debug] Full audio — RMS: ${audioRMS.toFixed(5)}, ` +
-      `Peak: ${audioPeak.toFixed(5)}, ` +
-      `Duration: ${totalSeconds.toFixed(2)} s, ` +
-      `Samples: ${audio.length.toLocaleString()}`
-    );
-    console.log(
-      `[debug] Config — enablePrompting: ${enablePrompting}, ` +
-      `enableVadPadding: ${enableVadPadding}, ` +
-      `enableThresholds: ${enableThresholds}`
-    );
-    console.log(
-      debugMode
-        ? "[debug] ⚠️  Using STOCK Whisper parameters (no anti-artifact thresholds)"
-        : "[debug] Using tuned anti-artifact thresholds"
-    );
-  }
 
   self.postMessage({
     type: "chunk_progress",
     current: 0, total, progress: 0,
     partialText:      "",
-    statusLabel:      debugMode ? "⚙️ Debug Mode — Starting…" : "Starting transcription…",
+    statusLabel:      "Starting transcription…",
     processedSeconds: 0,
     totalSeconds,
     timeRemaining:    null,
@@ -268,49 +175,8 @@ async function transcribeAudio(audio, config) {
   for (let i = 0; i < total; i++) {
     const { slice, startSec, coreSamples } = chunks[i];
     const label = total === 1
-      ? (debugMode ? "⚙️ Debug Transcribing…" : "Transcribing…")
-      : (debugMode
-          ? `⚙️ Debug chunk ${i + 1}/${total}…`
-          : `Transcribing chunk ${i + 1} of ${total}…`);
-
-    if (debugMode) {
-      // Core slice (without padding) for accurate signal stats
-      const core = audio.slice(
-        Math.round(startSec * SR),
-        Math.min(Math.round(startSec * SR) + coreSamples, audio.length)
-      );
-      const coreRMS  = computeRMS(core);
-      const corePeak = computePeak(core);
-      const silentPct = (() => {
-        let silentCount = 0;
-        for (let s = 0; s < core.length; s++) if (Math.abs(core[s]) < 0.001) silentCount++;
-        return ((silentCount / core.length) * 100).toFixed(1);
-      })();
-
-      console.group(
-        `[debug] ── Chunk ${i + 1}/${total} ──  ` +
-        `offset ${startSec.toFixed(1)} s, core ${(coreSamples / SR).toFixed(1)} s`
-      );
-      console.log(
-        `[debug] Signal: RMS=${coreRMS.toFixed(5)}, Peak=${corePeak.toFixed(5)}, ` +
-        `~${silentPct}% near-silent samples (<0.001)`
-      );
-      console.log(
-        `[debug] Padding: ${enableVadPadding ? `${VAD_PAD_S * 1000} ms each side` : "none"}`
-      );
-      const prompt = enablePrompting ? buildPrompt(parts) : undefined;
-      console.log(
-        `[debug] Prompt: ${prompt
-          ? `"…${prompt.slice(-80)}" (${prompt.length} chars)`
-          : "none"}`
-      );
-      if (coreRMS < 0.005) {
-        console.warn(
-          `[debug] ⚠️  VERY LOW SIGNAL on chunk ${i + 1} ` +
-          `(RMS ${coreRMS.toFixed(5)}) — Whisper may output empty or hallucinated text`
-        );
-      }
-    }
+      ? "Transcribing…"
+      : `Transcribing chunk ${i + 1} of ${total}…`;
 
     console.log(
       `[worker] Chunk ${i + 1}/${total} START — ` +
@@ -318,7 +184,7 @@ async function transcribeAudio(audio, config) {
     );
     const t = performance.now();
 
-    const prompt = enablePrompting ? buildPrompt(parts) : undefined;
+    const prompt = buildPrompt(parts);
 
     let tokenCount = 0;
     const output = await pipe(slice, {
@@ -328,31 +194,14 @@ async function transcribeAudio(audio, config) {
       stride_length_s:   STRIDE_S,
       return_timestamps: false,
 
-      // Anti-artifact thresholds — skipped in debug/raw mode
-      ...(enableThresholds ? {
-        condition_on_previous_text: true,
-        logprob_threshold:          -0.8,
-        no_speech_threshold:         0.35,
-        repetition_penalty:          1.1,
-        num_beams:                   5,
-      } : {}),
+      condition_on_previous_text: true,
+      repetition_penalty:         1.1,
+      num_beams:                  1,
 
-      // Cross-chunk context prompt — skipped when disabled
       ...(prompt !== undefined ? { prompt } : {}),
 
       callback_function: (beams) => {
         tokenCount++;
-
-        // Debug: log beam scores every 50 tokens to surface logprob signals
-        if (debugMode && tokenCount % 50 === 0 && beams?.length) {
-          const beam = beams[0];
-          console.log(
-            `[debug] Token ${tokenCount} — ` +
-            `score: ${beam.score?.toFixed(4) ?? "n/a"}, ` +
-            `output_token_ids.length: ${beam.output_token_ids?.length ?? "n/a"}`
-          );
-        }
-
         if (tokenCount % 10 === 0) {
           const processedSeconds  = Math.min(startSec + CHUNK_S, totalSeconds);
           const progressFraction  = (i + tokenCount / 500) / total;
@@ -381,18 +230,6 @@ async function transcribeAudio(audio, config) {
     const progressFraction  = (i + 1) / total;
     const remainingAudioSec = Math.max(0, totalSeconds - processedSeconds);
 
-    if (debugMode) {
-      const verdict = text
-        ? `✅ "${text.slice(0, 100)}${text.length > 100 ? "…" : ""}"`
-        : "⚠️  EMPTY — no speech detected by model";
-      console.log(
-        `[debug] Chunk ${i + 1} result: ${verdict}\n` +
-        `        tokens=${tokenCount}, wall=${wallMs.toFixed(0)} ms, ` +
-        `tokens/s=${(tokenCount / (wallMs / 1000)).toFixed(1)}`
-      );
-      console.groupEnd();
-    }
-
     console.log(
       `[worker] Chunk ${i + 1}/${total} END — ${wallMs.toFixed(0)} ms — ` +
       `"${text.slice(0, 60)}${text.length > 60 ? "…" : ""}"`
@@ -412,15 +249,7 @@ async function transcribeAudio(audio, config) {
 
   console.groupEnd();
   const finalText = parts.join(" ").trim();
-
-  if (debugMode) {
-    console.log("─".repeat(60));
-    console.log(`[debug] ✅ FINAL RESULT (${finalText.length} chars, ${total} chunks)`);
-    console.log(`[debug] "${finalText.slice(0, 300)}${finalText.length > 300 ? "…" : ""}"`);
-    console.log("─".repeat(60));
-  } else {
-    console.log(`[worker] Inference COMPLETE — "${finalText.slice(0, 120)}"`);
-  }
+  console.log(`[worker] Inference COMPLETE — "${finalText.slice(0, 120)}"`);
 
   self.postMessage({ type: "result", text: finalText });
 }
@@ -430,9 +259,9 @@ async function transcribeAudio(audio, config) {
 self.addEventListener("message", async (e) => {
   try {
     if (e.data.type === "load") {
-      await getOrLoadModel(e.data.modelName ?? MODEL_MEDIUM);
+      await getOrLoadModel();
     } else if (e.data.type === "transcribe") {
-      await transcribeAudio(e.data.audio, e.data.config);
+      await transcribeAudio(e.data.audio);
     }
   } catch (err) {
     console.error("[worker] ERROR:", err);

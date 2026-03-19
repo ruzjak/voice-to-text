@@ -1,37 +1,6 @@
 const TARGET_SAMPLE_RATE = 16_000;
 
 /**
- * Resamples an already-decoded AudioBuffer to 16 kHz mono Float32Array.
- * Use this when you have a buffer in hand (e.g. after audio enhancement)
- * and want to skip the file-decode step.
- */
-export async function resampleBufferTo16kHz(buffer: AudioBuffer): Promise<Float32Array> {
-  console.log(
-    `[resample] Buffer Resampling START — ${buffer.sampleRate} Hz → ${TARGET_SAMPLE_RATE} Hz mono, ` +
-    `duration: ${buffer.duration.toFixed(2)} s`
-  );
-  const t = performance.now();
-
-  const numFrames = Math.ceil(buffer.duration * TARGET_SAMPLE_RATE);
-  const offlineCtx = new OfflineAudioContext(1, numFrames, TARGET_SAMPLE_RATE);
-  const source = offlineCtx.createBufferSource();
-  source.buffer = buffer;
-  source.connect(offlineCtx.destination);
-  source.start(0);
-
-  const rendered = await offlineCtx.startRendering();
-  const pcm = rendered.getChannelData(0);
-
-  console.log(
-    `[resample] Buffer Resampling END — output samples: ${pcm.length} ` +
-    `(${(performance.now() - t).toFixed(0)} ms)`
-  );
-
-  return pcm;
-}
-
-
-/**
  * Decodes an audio File and resamples it to 16 kHz mono Float32Array —
  * the exact format Whisper expects.
  *
